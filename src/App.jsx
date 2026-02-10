@@ -10,6 +10,8 @@ const CHART_TIMEOUT_MS = 180_000;
 const POLL_INTERVAL_MS = 1_000;
 const PINNED_KEY = 'wren-ui-lite:pinned-charts';
 const CHARTS_KEY = 'wren-ui-lite:chart-history';
+const THREADS_KEY = 'wren-ui-lite:threads';
+const ACTIVE_THREAD_KEY = 'wren-ui-lite:active-thread';
 
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
@@ -54,12 +56,18 @@ const getJson = async (url, signal) => {
   return response.json();
 };
 
-const startAsk = async (query, signal) => {
+const startAsk = async (query, threadId, histories, signal) => {
   const payload = {
     request_from: 'ui',
     query,
     mdl_hash: MDL_HASH,
   };
+  if (threadId) {
+    payload.thread_id = threadId;
+  }
+  if (histories && histories.length) {
+    payload.histories = histories;
+  }
 
   const data = await postJson(buildUrl('/v1/asks'), payload, signal);
   if (!data?.query_id) {
@@ -93,7 +101,7 @@ const pollAskResult = async (queryId, signal) => {
   }
 };
 
-const startChart = async (query, sql, signal) => {
+const startChart = async (query, sql, threadId, signal) => {
   const payload = {
     request_from: 'ui',
     query,
@@ -101,6 +109,9 @@ const startChart = async (query, sql, signal) => {
     remove_data_from_chart_schema: false,
     configurations: { language: LANGUAGE },
   };
+  if (threadId) {
+    payload.thread_id = threadId;
+  }
 
   const data = await postJson(buildUrl('/v1/charts'), payload, signal);
   if (!data?.query_id) {
@@ -158,28 +169,71 @@ const extractTitle = (spec, fallback) => {
   return fallback;
 };
 
+const normalizeThread = (thread) => ({
+  ...thread,
+  pinned: Boolean(thread?.pinned),
+  charts: Array.isArray(thread?.charts) ? thread.charts : [],
+});
+
 export default function App() {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('idle');
   const [error, setError] = useState('');
-  const [charts, setCharts] = useState([]);
+  const [threads, setThreads] = useState([]);
+  const [activeThreadId, setActiveThreadId] = useState(null);
   const [pinnedCharts, setPinnedCharts] = useState([]);
   const [view, setView] = useState(
     window.location.hash === '#pinned' ? 'pinned' : 'charts',
   );
   const [pinCandidate, setPinCandidate] = useState(null);
   const [deleteCandidate, setDeleteCandidate] = useState(null);
+  const [isThreadSidebarMinimized, setIsThreadSidebarMinimized] = useState(false);
+  const [threadMenuOpenId, setThreadMenuOpenId] = useState(null);
+  const [renameThreadId, setRenameThreadId] = useState(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [deleteThreadId, setDeleteThreadId] = useState(null);
   const controllerRef = useRef(null);
   const statusTimerRef = useRef(null);
+  const sidebarWidth = isThreadSidebarMinimized ? '56px' : '240px';
 
   useEffect(() => {
-    const storedCharts = localStorage.getItem(CHARTS_KEY);
-    if (storedCharts) {
+    const storedThreads = localStorage.getItem(THREADS_KEY);
+    if (storedThreads) {
       try {
-        setCharts(JSON.parse(storedCharts));
+        const parsed = JSON.parse(storedThreads);
+        if (Array.isArray(parsed)) {
+          setThreads(parsed.map(normalizeThread));
+        } else {
+          setThreads([]);
+        }
       } catch {
-        setCharts([]);
+        setThreads([]);
       }
+    } else {
+      const storedCharts = localStorage.getItem(CHARTS_KEY);
+      if (storedCharts) {
+        try {
+          const legacyCharts = JSON.parse(storedCharts);
+          if (Array.isArray(legacyCharts) && legacyCharts.length) {
+            const migratedThread = {
+              id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}`,
+              title: legacyCharts[0]?.query || 'Thread',
+              createdAt: legacyCharts[0]?.createdAt || new Date().toISOString(),
+              pinned: false,
+              charts: legacyCharts,
+            };
+            setThreads([migratedThread]);
+            localStorage.setItem(THREADS_KEY, JSON.stringify([migratedThread]));
+          }
+        } catch {
+          setThreads([]);
+        }
+      }
+    }
+
+    const storedActive = localStorage.getItem(ACTIVE_THREAD_KEY);
+    if (storedActive) {
+      setActiveThreadId(storedActive);
     }
 
     const stored = localStorage.getItem(PINNED_KEY);
@@ -199,6 +253,18 @@ export default function App() {
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
+
+  useEffect(() => {
+    if (activeThreadId && !threads.find((thread) => thread.id === activeThreadId)) {
+      persistActiveThread(null);
+    }
+  }, [threads, activeThreadId]);
+
+  useEffect(() => {
+    if (!activeThreadId && threads.length > 0) {
+      persistActiveThread(threads[0].id);
+    }
+  }, [threads, activeThreadId]);
 
   useEffect(() => {
     if (statusTimerRef.current) {
@@ -236,16 +302,25 @@ export default function App() {
     }
   };
 
-  const persistCharts = (updater) => {
-    setCharts((prev) => {
+  const persistThreads = (updater) => {
+    setThreads((prev) => {
       const next = typeof updater === 'function' ? updater(prev) : updater;
       try {
-        localStorage.setItem(CHARTS_KEY, JSON.stringify(next));
+        localStorage.setItem(THREADS_KEY, JSON.stringify(next));
       } catch (err) {
-        console.warn('Failed to persist charts:', err);
+        console.warn('Failed to persist threads:', err);
       }
       return next;
     });
+  };
+
+  const persistActiveThread = (threadId) => {
+    setActiveThreadId(threadId);
+    if (threadId) {
+      localStorage.setItem(ACTIVE_THREAD_KEY, threadId);
+    } else {
+      localStorage.removeItem(ACTIVE_THREAD_KEY);
+    }
   };
 
   const navigate = (nextView) => {
@@ -271,7 +346,21 @@ export default function App() {
     setStatus('asking');
 
     try {
-      const askQueryId = await startAsk(query.trim(), controller.signal);
+      const threadId =
+        activeThreadId || (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}`);
+      const isNewThread = !activeThreadId;
+      const currentThread = threads.find((thread) => thread.id === threadId);
+      const histories = currentThread
+        ? currentThread.charts
+            .filter((chart) => chart.sql)
+            .map((chart) => ({ question: chart.query, sql: chart.sql }))
+        : [];
+      const askQueryId = await startAsk(
+        query.trim(),
+        threadId,
+        histories,
+        controller.signal,
+      );
       const askResult = await pollAskResult(askQueryId, controller.signal);
       const sql = askResult?.response?.[0]?.sql;
 
@@ -281,7 +370,12 @@ export default function App() {
 
       setStatus('charting');
 
-      const chartQueryId = await startChart(query.trim(), sql, controller.signal);
+      const chartQueryId = await startChart(
+        query.trim(),
+        sql,
+        threadId,
+        controller.signal,
+      );
       const chartResult = await pollChartResult(
         chartQueryId,
         controller.signal,
@@ -294,13 +388,41 @@ export default function App() {
 
       const chartPayload = {
         id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}`,
+        threadId,
         query: query.trim(),
         title: extractTitle(spec, query.trim()),
+        sql,
         spec,
         createdAt: new Date().toISOString(),
       };
 
-      persistCharts((prev) => [...prev, chartPayload]);
+      persistThreads((prev) => {
+        const next = [...prev];
+        const threadIndex = next.findIndex((thread) => thread.id === threadId);
+        if (threadIndex === -1) {
+          next.push({
+            id: threadId,
+            title: query.trim(),
+            createdAt: new Date().toISOString(),
+            pinned: false,
+            charts: [chartPayload],
+          });
+        } else {
+          const thread = next[threadIndex];
+          next[threadIndex] = {
+            ...thread,
+            title:
+              thread.title === 'New thread' && thread.charts.length === 0
+                ? query.trim()
+                : thread.title,
+            charts: [...thread.charts, chartPayload],
+          };
+        }
+        return next;
+      });
+      if (isNewThread) {
+        persistActiveThread(threadId);
+      }
       setQuery('');
       setStatus('done');
     } catch (err) {
@@ -346,6 +468,25 @@ export default function App() {
     setPinCandidate(null);
   };
 
+  const startNewThread = () => {
+    const newId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}`;
+    persistThreads((prev) => [
+      {
+        id: newId,
+        title: 'New thread',
+        createdAt: new Date().toISOString(),
+        pinned: false,
+        charts: [],
+      },
+      ...prev,
+    ]);
+    persistActiveThread(newId);
+  };
+
+  const selectThread = (threadId) => {
+    persistActiveThread(threadId);
+  };
+
   const requestDelete = (chart) => {
     setDeleteCandidate(chart);
   };
@@ -361,93 +502,304 @@ export default function App() {
     setDeleteCandidate(null);
   };
 
+  const toggleThreadMenu = (threadId) => {
+    setThreadMenuOpenId((prev) => (prev === threadId ? null : threadId));
+  };
+
+  const closeThreadMenu = () => {
+    setThreadMenuOpenId(null);
+  };
+
+  const startRenameThread = (thread) => {
+    setRenameThreadId(thread.id);
+    setRenameValue(thread.title);
+    closeThreadMenu();
+  };
+
+  const confirmRenameThread = () => {
+    if (!renameThreadId) {
+      return;
+    }
+    const nextTitle = renameValue.trim();
+    if (!nextTitle) {
+      return;
+    }
+    persistThreads((prev) =>
+      prev.map((thread) =>
+        thread.id === renameThreadId ? { ...thread, title: nextTitle } : thread,
+      ),
+    );
+    setRenameThreadId(null);
+    setRenameValue('');
+  };
+
+  const cancelRenameThread = () => {
+    setRenameThreadId(null);
+    setRenameValue('');
+  };
+
+  const reorderThreads = (list, prioritizeId = null) => {
+    const pinned = [];
+    const unpinned = [];
+    list.forEach((thread) => {
+      if (thread.pinned) {
+        pinned.push(thread);
+      } else {
+        unpinned.push(thread);
+      }
+    });
+    if (prioritizeId) {
+      const idx = pinned.findIndex((thread) => thread.id === prioritizeId);
+      if (idx > 0) {
+        const [thread] = pinned.splice(idx, 1);
+        pinned.unshift(thread);
+      }
+    }
+    return [...pinned, ...unpinned];
+  };
+
+  const pinThreadToTop = (threadId) => {
+    persistThreads((prev) =>
+      reorderThreads(
+        prev.map((thread) =>
+          thread.id === threadId ? { ...thread, pinned: true } : thread,
+        ),
+        threadId,
+      ),
+    );
+    closeThreadMenu();
+  };
+
+  const unpinThread = (threadId) => {
+    persistThreads((prev) =>
+      reorderThreads(
+        prev.map((thread) =>
+          thread.id === threadId ? { ...thread, pinned: false } : thread,
+        ),
+      ),
+    );
+    closeThreadMenu();
+  };
+
+  const requestDeleteThread = (threadId) => {
+    setDeleteThreadId(threadId);
+    closeThreadMenu();
+  };
+
+  const confirmDeleteThread = () => {
+    if (!deleteThreadId) {
+      return;
+    }
+    persistThreads((prev) => prev.filter((thread) => thread.id !== deleteThreadId));
+    if (activeThreadId === deleteThreadId) {
+      persistActiveThread(null);
+    }
+    setDeleteThreadId(null);
+  };
+
+  const cancelDeleteThread = () => {
+    setDeleteThreadId(null);
+  };
+
   return (
-    <div className="app">
-      <div className="topbar">
-        <div className="nav">
-          <button
-            type="button"
-            className={`nav-button ${view === 'charts' ? 'active' : ''}`}
-            onClick={() => navigate('charts')}
-          >
-            Charts
-          </button>
-          <button
-            type="button"
-            className={`nav-button ${view === 'pinned' ? 'active' : ''}`}
-            onClick={() => navigate('pinned')}
-          >
-            Pinned
-          </button>
-        </div>
+    <div className="app" style={{ '--sidebar-width': sidebarWidth }}>
+      <div className="sidebar-fixed-header">
+        <button
+          type="button"
+          className="sidebar-action"
+          onClick={() => navigate(view === 'charts' ? 'pinned' : 'charts')}
+        >
+          {view === 'charts' ? 'Dashboard' : 'Chat'}
+        </button>
       </div>
+      <div className="layout">
+        <main className="main">
+          <div className="chart-feed">
+            {view === 'charts' && threads.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-title">No charts yet.</div>
+                <div className="empty-subtitle">
+                  Ask a question to generate your first chart.
+                </div>
+              </div>
+            ) : null}
 
-      <div className="chart-feed">
-        {view === 'charts' && charts.length === 0 ? (
-          <div className="empty-state">
-            <div className="empty-title">No charts yet.</div>
-            <div className="empty-subtitle">
-              Ask a question to generate your first chart.
-            </div>
+            {view === 'charts' &&
+            threads.length > 0 &&
+            !(threads.find((thread) => thread.id === activeThreadId)?.charts || [])
+              .length ? (
+              <div className="empty-state">
+                <div className="empty-title">Start this thread.</div>
+                <div className="empty-subtitle">
+                  Ask a question to create the first chart in this thread.
+                </div>
+              </div>
+            ) : null}
+
+            {view === 'pinned' && pinnedCharts.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-title">No pinned charts.</div>
+                <div className="empty-subtitle">
+                  Pin a chart to see it here.
+                </div>
+              </div>
+            ) : null}
+
+            {view === 'charts' ? (
+              <div className="thread-section">
+                {(threads.find((thread) => thread.id === activeThreadId)?.charts ||
+                  []).map((item) => (
+                  <div className="chart-card" key={item.id}>
+                    <div className="chart-card-header">
+                      <div className="chart-card-title">
+                        <span className="chart-title-pill">{item.query}</span>
+                      </div>
+                      <div className="chart-actions">
+                        <button
+                          type="button"
+                          className="pin-button"
+                          onClick={() => requestPin(item)}
+                        >
+                          Pin
+                        </button>
+                      </div>
+                    </div>
+                    <div className="chart-body">
+                      <ChartView spec={item.spec} onError={handleChartError} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="pinned-grid">
+                {pinnedCharts.map((item) => {
+                  const title = item.title || extractTitle(item.spec, item.query);
+                  return (
+                    <div className="chart-card chart-card--pinned" key={item.id}>
+                      <div className="chart-card-header">
+                        <div className="chart-card-title">
+                          <span className="chart-title-pill">{title}</span>
+                        </div>
+                        <div className="chart-actions">
+                          <button
+                            type="button"
+                            className="menu-button"
+                            onClick={() => requestDelete(item)}
+                          >
+                            ...
+                          </button>
+                        </div>
+                      </div>
+                      <div className="chart-body">
+                        <ChartView spec={item.spec} onError={handleChartError} />
+                      </div>
+                      <div className="chart-footer">
+                        Last refreshed: {formatTimestamp(item.createdAt)}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
-        ) : null}
+        </main>
 
-        {view === 'pinned' && pinnedCharts.length === 0 ? (
-          <div className="empty-state">
-            <div className="empty-title">No pinned charts.</div>
-            <div className="empty-subtitle">
-              Pin a chart to see it here.
-            </div>
-          </div>
-        ) : null}
-
-        <div className={view === 'pinned' ? 'pinned-grid' : 'chart-list'}>
-          {(view === 'charts' ? charts : pinnedCharts).map((item) => {
-            const title =
-              view === 'pinned'
-                ? item.title || extractTitle(item.spec, item.query)
-                : item.query;
-            return (
-            <div
-              className={`chart-card ${view === 'pinned' ? 'chart-card--pinned' : ''}`}
-              key={item.id}
+        {view === 'charts' ? (
+          <aside
+            className={`sidebar sidebar--right ${
+              isThreadSidebarMinimized ? 'minimized' : ''
+            }`}
+          >
+            <button
+              type="button"
+              className="sidebar-toggle"
+              onClick={() => setIsThreadSidebarMinimized((prev) => !prev)}
             >
-              <div className="chart-card-header">
-                <div className="chart-card-title">
-                  <span className="chart-title-pill">{title}</span>
-                </div>
-                <div className="chart-actions">
-                  {view === 'pinned' ? (
-                    <button
-                      type="button"
-                      className="menu-button"
-                      onClick={() => requestDelete(item)}
+              {isThreadSidebarMinimized ? '<' : '>'}
+            </button>
+            {!isThreadSidebarMinimized ? (
+              <div className="sidebar-content">
+                <div className="sidebar-title">Threads</div>
+                <button
+                  type="button"
+                  className="thread-button"
+                  onClick={startNewThread}
+                >
+                  New Chat
+                </button>
+                <div className="thread-list">
+                  {threads.map((thread) => (
+                    <div
+                      key={thread.id}
+                      className={`thread-item ${
+                        activeThreadId === thread.id ? 'active' : ''
+                      }`}
                     >
-                      ...
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="pin-button"
-                      onClick={() => requestPin(item)}
-                    >
-                      Pin
-                    </button>
-                  )}
+                      <button
+                        type="button"
+                        className="thread-item-button"
+                        onClick={() => selectThread(thread.id)}
+                      >
+                        <span className="thread-item-label">{thread.title}</span>
+                        {thread.pinned ? (
+                          <span className="thread-pin-icon" aria-label="Pinned">
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path
+                                d="M14 3c1.1 0 2 .9 2 2v4l3 3v2h-6v6l-1 2-1-2v-6H5v-2l3-3V5c0-1.1.9-2 2-2h4z"
+                                fill="currentColor"
+                              />
+                            </svg>
+                          </span>
+                        ) : null}
+                      </button>
+                      <div className="thread-item-actions">
+                        <button
+                          type="button"
+                          className="menu-button"
+                          onClick={() => toggleThreadMenu(thread.id)}
+                        >
+                          ...
+                        </button>
+                        {threadMenuOpenId === thread.id ? (
+                          <div className="thread-menu">
+                            <button
+                              type="button"
+                              onClick={() => startRenameThread(thread)}
+                            >
+                              Rename
+                            </button>
+                            {thread.pinned ? (
+                              <button
+                                type="button"
+                                onClick={() => unpinThread(thread.id)}
+                              >
+                                Unpin from top
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => pinThreadToTop(thread.id)}
+                              >
+                                Pin to top
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="danger"
+                              onClick={() => requestDeleteThread(thread.id)}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
-              <div className="chart-body">
-                <ChartView spec={item.spec} onError={handleChartError} />
-              </div>
-              {view === 'pinned' ? (
-                <div className="chart-footer">
-                  Last refreshed: {formatTimestamp(item.createdAt)}
-                </div>
-              ) : null}
-            </div>
-            );
-          })}
-        </div>
+            ) : null}
+          </aside>
+        ) : null}
       </div>
 
       {view === 'charts' ? (
@@ -510,6 +862,60 @@ export default function App() {
                   type="button"
                   className="modal-button modal-button--primary"
                   onClick={confirmDelete}
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {renameThreadId ? (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal">
+            <div className="modal-icon">!</div>
+            <div className="modal-content">
+              <div className="modal-title">Rename thread</div>
+              <input
+                className="modal-input"
+                value={renameValue}
+                onChange={(event) => setRenameValue(event.target.value)}
+                placeholder="Thread name"
+              />
+              <div className="modal-actions">
+                <button type="button" className="modal-button" onClick={cancelRenameThread}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="modal-button modal-button--primary"
+                  onClick={confirmRenameThread}
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {deleteThreadId ? (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal">
+            <div className="modal-icon">!</div>
+            <div className="modal-content">
+              <div className="modal-title">
+                Are you sure you want to delete this thread?
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="modal-button" onClick={cancelDeleteThread}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="modal-button modal-button--primary"
+                  onClick={confirmDeleteThread}
                 >
                   Delete
                 </button>
