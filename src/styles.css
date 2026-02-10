@@ -72,12 +72,17 @@ body {
   width: var(--sidebar-expanded-width);
   height: var(--sidebar-header-height);
   padding: 12px 16px;
-  background: #fafafa;
-  border-bottom: 1px solid var(--border);
+  background: transparent;
+  border-bottom: none;
   z-index: 6;
   display: flex;
   align-items: center;
   box-sizing: border-box;
+  border-left: none;
+}
+
+.app.sidebar-open .sidebar-fixed-header {
+  border-left: 1px solid var(--border);
 }
 
 .sidebar-content {

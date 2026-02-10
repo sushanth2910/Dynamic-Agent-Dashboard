@@ -601,8 +601,13 @@ export default function App() {
     setDeleteThreadId(null);
   };
 
+  const sidebarClass =
+    view === 'charts' && !isThreadSidebarMinimized
+      ? 'sidebar-open'
+      : 'sidebar-closed';
+
   return (
-    <div className="app" style={{ '--sidebar-width': sidebarWidth }}>
+    <div className={`app ${sidebarClass}`} style={{ '--sidebar-width': sidebarWidth }}>
       <div className="sidebar-fixed-header">
         <button
           type="button"
